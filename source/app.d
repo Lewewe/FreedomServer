@@ -40,6 +40,8 @@ enum dsId = -2;
 __gshared ADI v1Adi;
 __gshared Device v1Device;
 
+__gshared Duration timeout;
+
 int main(string[] args) {
 	debug {
 		configureLoggingProvider(new shared DefaultProvider(true, Levels.DEBUG));
@@ -57,14 +59,19 @@ int main(string[] args) {
 	string certificateChainPath = null;
 	string privateKeyPath = null;
 
+	long timeoutMsecs = 3000;
+
 	auto helpInformation = getopt(
 		args,
 		"n|host", format!"The hostname to bind to (default: %s)"(hostname), &hostname,
 		"p|port", format!"The port to bind to (default: %s)"(port), &port,
 		"a|adi-path", format!"Where the provisioning information should be stored on the computer for anisette-v1 backwards compat (default: %s)"(configurationPath), &configurationPath,
+		"timeout", format!"Timeout duration for Anisette V3 in milliseconds (default: %d)"(timeoutMsecs), &timeoutMsecs,
 		"private-key", "Path to the PEM-formatted private key file for HTTPS support (requires --cert-chain)", &certificateChainPath,
 		"cert-chain", "Path to the PEM-formatted certificate chain file for HTTPS support (requires --private-key)", &privateKeyPath,
 	);
+
+	timeout = dur!"msecs"(timeoutMsecs);
 
 	if ((certificateChainPath && !privateKeyPath) || (!certificateChainPath && privateKeyPath)) {
 		log.error("--certificate-chain and --private-key must both be specified for HTTPS support (they can be both be in the same file though).");
@@ -241,9 +248,12 @@ class AnisetteService {
 			file.write(provisioningPath.buildPath("adi.pb"), adi_pb);
 
 			GC.disable(); // garbage collector can deallocate ADI parts since it can't find the pointers.
-			scope(exit) GC.enable();
+			scope(exit) {
+				GC.enable();
+				GC.collect();
+			}
 
-			ADI adi = makeGarbageCollectedADI(libraryPath);
+			scope ADI adi = makeGarbageCollectedADI(libraryPath);
 			adi.provisioningPath = provisioningPath;
 			adi.identifier = identifier.toUpper()[0..16];
 
@@ -279,11 +289,8 @@ class AnisetteService {
 					.buildPath(identifier)
 				);
 			}
-			GC.collect();
 		}
 	}
-
-	enum timeout = dur!"msecs"(1250);
 
 	@method(HTTPMethod.GET)
 	@path("/v3/provisioning_session")
@@ -306,7 +313,6 @@ class AnisetteService {
 			];
 			log.infoF!"[>> %s] Timeout!"(requestUUID);
 			socket.send(timeoutJs.toString(JSONOptions.doNotEscapeSlashes));
-			socket.close();
 			return;
 		}
 
@@ -324,15 +330,17 @@ class AnisetteService {
 
 			log.infoF!"[>> %s] It is invalid: %s"(requestUUID, ex);
 			socket.send(response.toString(JSONOptions.doNotEscapeSlashes));
-			socket.close();
 			return;
 		}
 
 		log.infoF!("[<< %s] Correct identifier (%s).")(requestUUID, identifier);
 
 		GC.disable(); // garbage collector can deallocate ADI parts since it can't find the pointers.
-		scope(exit) GC.enable();
-		ADI adi = makeGarbageCollectedADI(libraryPath);
+		scope(exit) {
+			GC.enable();
+			GC.collect();
+		}
+		scope ADI adi = makeGarbageCollectedADI(libraryPath);
 		auto provisioningPath = file.getcwd()
 			.buildPath("provisioning")
 			.buildPath(identifier);
@@ -357,7 +365,6 @@ class AnisetteService {
 			];
 			log.infoF!"[>> %s] Timeout!"(requestUUID);
 			socket.send(timeoutJs.toString(JSONOptions.doNotEscapeSlashes));
-			socket.close();
 			return;
 		}
 
@@ -369,6 +376,7 @@ class AnisetteService {
 			log.infoF!"[<< %s] Received SPIM."(requestUUID);
 			auto cpimAndCo = adi.startProvisioning(-2, Base64.decode(spim));
 			session = cpimAndCo.session;
+			scope(failure) adi.destroyProvisioning(session);
 
 			response = [
 				"result": "GiveEndProvisioningData",
@@ -394,7 +402,6 @@ class AnisetteService {
 			];
 			log.infoF!"[>> %s] Timeout!"(requestUUID);
 			socket.send(timeoutJs.toString(JSONOptions.doNotEscapeSlashes));
-			socket.close();
 			return;
 		}
 
@@ -432,7 +439,7 @@ class AnisetteService {
 
 private ADI makeGarbageCollectedADI(string libraryPath) {
 	extern(C) void* malloc_GC(size_t sz) {
-		return GC.malloc(sz);
+		return GC.malloc(sz, GC.BlkAttr.NO_MOVE | GC.BlkAttr.NO_SCAN);
 	}
 
 	extern(C) void free_GC(void* ptr) {
